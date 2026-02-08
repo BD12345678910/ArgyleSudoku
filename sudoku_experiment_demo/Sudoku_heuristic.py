@@ -6,11 +6,71 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import sqlite3
 import jz3 as z3
+#from z3_wrapper import Solver
 from jz3.src.z3_wrapper import Solver
+conn = sqlite3.connect('heuristic.db')
+cursor = conn.cursor()
+create_table ="""
+        CREATE TABLE IF NOT EXISTS problem_solving_results (
+            ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_instance INTEGER,
+            problem_grid TEXT,
+            idx TEXT,
+            try_val INTEGER,
+            is_sat TEXT,
+            is_classic INTEGER DEFAULT 0,
+            is_distinct INTEGER DEFAULT 0,
+            is_per_col INTEGER DEFAULT 0,
+            is_no_num INTEGER DEFAULT 0,
+            is_prefill INTEGER DEFAULT 0,
+            res_time_z3 REAL,
+            res_timeout_z3 INTEGER DEFAULT 0
+        );"""
+cursor.execute(create_table)
+conn.commit()
+def insert_single_data(data):
+    """插入单条数据（适配idx字段和布尔型cond_is_classic）"""
+    cursor = conn.cursor()
+    insert_sql = """
+    INSERT INTO problem_solving_results (
+        problem_instance, problem_grid, idx, try_val,is_sat,
+        is_classic, is_distinct,is_per_col,is_no_num, is_prefill,
+        res_time_z3, res_timeout_z3
+    ) VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?,?,?); 
+    """
+    cursor.execute(insert_sql, data)
+    conn.commit()
 
-
+def to_data(
+    i, j,
+    _nums,
+    try_val,
+    is_sat,
+    is_classic,
+    is_distinct,
+    is_per_col,
+    is_no_num,
+    is_prefill,
+    res_time_z3,
+    res_timeout_z3
+):
+    data = (
+        i*9 + j,
+        ''.join(str(element) for row in _nums for element in row),
+        f"({i},{j})",
+        try_val,
+        is_sat,
+        is_classic,
+        is_distinct,
+        is_per_col,
+        is_no_num,
+        is_prefill,
+        res_time_z3,
+        res_timeout_z3
+    )
+    return data
 class Sudoku:
     _valid_charset = set(range(0, 10))
     
@@ -55,9 +115,10 @@ class Sudoku:
         self._timeout_ms = timeout_ms
         self._max_count = max_count
         self._verbose = verbose
-        
         self._hard_smt_log_dir = hard_smt_log_dir
         self._hard_sudoku_log_path = hard_sudoku_log_path
+        self._times = []
+        self._cnt = 0
         
         random.seed(seed)
         
@@ -349,8 +410,30 @@ class Sudoku:
                         vals = list(range(1, 10))
                         random.shuffle(vals)
                         try_val = vals.pop()
+                        st = time.perf_counter()
                         check = self.check_condition(i, j, try_val)
-                    
+                        et = time.perf_counter()
+                        res_time = et - st
+                        res_timeout = 1 if check == z3.unknown else 0
+                        is_sat = 'sat' if check == z3.sat else 'unsat'
+                        data = to_data(
+                            i,
+                            j,
+                            self._nums,
+                            try_val,
+                            is_sat,
+                            int(self._classic),
+                            int((not self._no_num) and self._distinct is True),
+                            int(self._per_col),
+                            int(self._no_num),
+                            int(self._prefill),
+                            res_time,
+                            res_timeout
+                        )
+                        self._times.append(res_time)
+                        self._cnt += 1
+                        insert_single_data(data)
+
                     while check != z3.sat:
                         if check == z3.unknown:
                             # preserve original behavior: treat as hard instance
@@ -359,7 +442,29 @@ class Sudoku:
                         if len(vals) == 0:
                             raise RuntimeError(f"No valid value for cell ({i},{j}) under current encoding.")
                         try_val = vals.pop()
+                        st = time.perf_counter()
                         check = self.check_condition(i, j, try_val)
+                        et = time.perf_counter()
+                        res_time = et - st
+                        res_timeout = 1 if check == z3.unknown else 0
+                        is_sat = 'sat' if check == z3.sat else 'unsat'
+                        data = to_data(
+                            i,
+                            j,
+                            self._nums,
+                            try_val,
+                            is_sat,
+                            int(self._classic),
+                            int((not self._no_num) and self._distinct is True),
+                            int(self._per_col),
+                            int(self._no_num),
+                            int(self._prefill),
+                            res_time,
+                            res_timeout
+                        )
+                        self._times.append(res_time)
+                        self._cnt += 1
+                        insert_single_data(data)
                     
                     self.add_constraint(i, j, try_val)
                 
@@ -387,8 +492,29 @@ class Sudoku:
                                 if self._nums[r][c] == num and c in cols:
                                     cols.remove(c)
                                 continue
-                            
+                            st = time.perf_counter()
                             res = self.check_condition(r, c, num)
+                            et = time.perf_counter()
+                            res_time = et - st
+                            res_timeout = 1 if res == z3.unknown else 0
+                            is_sat = 'sat' if res == z3.sat else 'unsat'
+                            data = to_data(
+                                r,
+                                c,
+                                self._nums,
+                                num,
+                                is_sat,
+                                int(self._classic),
+                                int((not self._no_num) and self._distinct is True),
+                                int(self._per_col),
+                                int(self._no_num),
+                                int(self._prefill),
+                                res_time,
+                                res_timeout
+                            )
+                            self._times.append(res_time)
+                            self._cnt += 1
+                            insert_single_data(data)
                             if res == z3.sat:
                                 self.add_constraint(r, c, num)
                                 cols.remove(c)
@@ -433,7 +559,7 @@ class Sudoku:
         if verbose:
             print("Generating holes for solved puzzle...")
         
-        st = time.time()
+        st = time.perf_counter()
         penalty = 0
         sudoku_array = solved_sudoku_1d.copy()
         
@@ -456,7 +582,7 @@ class Sudoku:
                     sudoku_array[i * 9 + j] = 0
                 penalty += temp_penalty
         
-        return time.time() - st, penalty
+        return time.perf_counter() - st, penalty
     
     # -------------------------
     # Logging / SMT2 utilities
@@ -481,7 +607,7 @@ class Sudoku:
         os.makedirs(self._hard_smt_log_dir, exist_ok=True)
         os.makedirs(Path(self._hard_sudoku_log_path).parent, exist_ok=True)
         
-        time_str = time.strftime("%m_%d_%H_%M_%S") + (str(time.time()).split(".")[1])[1:4]
+        time_str = time.strftime("%m_%d_%H_%M_%S") + (str(time.perf_counter()).split(".")[1])[1:4]
         
         with open(os.path.join(self._hard_smt_log_dir, time_str), "w") as f:
             f.write(self._solver.generate_smtlib())
@@ -502,7 +628,7 @@ class Sudoku:
             log_file.write(json.dumps(log_entry) + "\n")
 
 
-def gen_full_sudoku(*constraints, seed=42, max_count=1, **kwargs) -> (float, int, List[List[int]]):
+def gen_full_sudoku(*constraints, seed=42, max_count=1, **kwargs):
     """
     setup empty grid. Call Sudoku.gen_full_sudoku().
     append generated full sudoku to the designated path as a string
@@ -513,14 +639,41 @@ def gen_full_sudoku(*constraints, seed=42, max_count=1, **kwargs) -> (float, int
     :return: (time, penalty)
     """
     empty_list = [0] * 81
-    st = time.time()
+    performance = {}
+    st = time.perf_counter()
     s = Sudoku(empty_list, *constraints, seed=seed, max_count=max_count, **kwargs)
     nums, penalty = s.gen_full_sudoku()
+    performance[constraints] = sum(s._times) / s._cnt
     smt2 = s.generate_smt2_transcript()
     with open("generated_full_sudoku.smt2", "w") as f:
         f.write(smt2)
-    et = time.time()
-    return et - st, penalty, nums
+    et = time.perf_counter()
+    return et - st, penalty, nums,performance
+
+def gen_multi_full_sudoku(constraints, seed=42, max_count=1, **kwargs):
+    """
+    setup empty grid. Call Sudoku.gen_full_sudoku().
+    append generated full sudoku to the designated path as a string
+
+    :param hard_smt_log_path:
+    :param constraints: [(classic, distinct, percol, no_num, prefill),...]
+    :param store_sudoku_path:
+    :return: (time, penalty)
+    """
+    performance = {}
+    complete_times = {}
+    for constraint in constraints:
+        empty_list = [0] * 81
+        st = time.perf_counter()
+        s = Sudoku(empty_list, *constraint, seed=seed, max_count=max_count, **kwargs)
+        nums, penalty = s.gen_full_sudoku()
+        performance[constraint] = sum(s._times) / s._cnt
+        smt2 = s.generate_smt2_transcript()
+        with open("generated_full_sudoku.smt2", "w") as f:
+            f.write(smt2)
+        et = time.perf_counter()
+        complete_times[constraint] = et - st
+    return complete_times, performance
 
 
 # def test_empty_grid_first_idx():
@@ -532,10 +685,18 @@ if __name__ == '__main__':
     # constraints = (True, False, True, True, True)
     constraints = (True, True, True, False, True)
     print(gen_full_sudoku(*constraints, seed=42, benchmark_mode=False, record_smt=True))  # (2.1086909770965576, ...)
+    constraints = []
+    for constraint in range(16,32):
+        binary_str = f"{constraint:05b}"
+        bool_tuple = tuple(bit == '1' for bit in binary_str)
+        constraints.append(bool_tuple)
+    complete_times, performance = gen_multi_full_sudoku(constraints, seed=42, benchmark_mode=False, record_smt=True)  # (2.1086909770965576, ...)
+    print('complete times:',complete_times)
+    print('performance:',performance)
     # After avoiding smt2 collection and generation -> 1.8983988761901855
     # After removing the meta solver and cached all the CV combinations -> 1.794215202331543
-    
     # 282 checks
     # raw smt2 file:  1.36s
     # after remove bool constraints:  0.41s
     # Remove all CV. Include only relavent constraints: 0.02s. ~25x slower
+    '''ID | problem_instance | problem_grid | problem_tryval | ... | cond_is_classic | cond_is_distinct | ... | res_time_z3 | res_time_cvc | res_timeout_z3 | res_timeout_cvc5'''
