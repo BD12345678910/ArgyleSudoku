@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sqlite3
 import jz3 as z3
-from z3_wrapper import Solver
-#from jz3.src.z3_wrapper import Solver
+#from z3_wrapper import Solver
+from jz3.src.z3_wrapper import Solver
 conn = sqlite3.connect('heuristic.db')
 cursor = conn.cursor()
 create_table ="""
