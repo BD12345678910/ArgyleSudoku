@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sqlite3
 import jz3 as z3
-#from z3_wrapper import Solver
-from jz3.src.z3_wrapper import Solver
+from z3_wrapper import Solver
+#from jz3.src.z3_wrapper import Solver
 conn = sqlite3.connect('heuristic.db')
 cursor = conn.cursor()
 create_table ="""
@@ -685,14 +685,34 @@ if __name__ == '__main__':
     # constraints = (True, False, True, True, True)
     constraints = (True, True, True, False, True)
     print(gen_full_sudoku(*constraints, seed=42, benchmark_mode=False, record_smt=True))  # (2.1086909770965576, ...)
-    constraints = []
-    for constraint in range(16,32):
-        binary_str = f"{constraint:05b}"
-        bool_tuple = tuple(bit == '1' for bit in binary_str)
-        constraints.append(bool_tuple)
+    constraints = [
+    # Arithmetic – Distinct
+    (True, True,  True,  False, True),
+    (True, True,  True,  False, False),
+    (True, True,  False, False, True),
+    (True, True,  False, False, False),
+    # Arithmetic – PbEq
+    (True, False, True,  False, True),
+    (True, False, True,  False, False),
+    (True, False, False, False, True),
+    (True, False, False, False, False),
+    # Boolean – PbEq
+    (True, None,  True,  True,  True),
+    (True, None,  True,  True,  False),
+    (True, None,  False, True,  True),
+    (True, None,  False, True,  False),
+    ]
     complete_times, performance = gen_multi_full_sudoku(constraints, seed=42, benchmark_mode=False, record_smt=True)  # (2.1086909770965576, ...)
     print('complete times:',complete_times)
     print('performance:',performance)
+    optimal_performance = min(performance.values())
+    for k,v in performance.items():
+        if v == optimal_performance:
+            optimal_constraint = k
+            break
+    print("optimal constraints:",optimal_constraint)
+    print("optimal performance:",optimal_performance)
+    
     # After avoiding smt2 collection and generation -> 1.8983988761901855
     # After removing the meta solver and cached all the CV combinations -> 1.794215202331543
     # 282 checks
