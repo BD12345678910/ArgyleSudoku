@@ -8,69 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sqlite3
 import jz3 as z3
-#from z3_wrapper import Solver
-from jz3.src.z3_wrapper import Solver
-conn = sqlite3.connect('heuristic.db')
-cursor = conn.cursor()
-create_table ="""
-        CREATE TABLE IF NOT EXISTS problem_solving_results (
-            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            problem_instance INTEGER,
-            problem_grid TEXT,
-            idx TEXT,
-            try_val INTEGER,
-            is_sat TEXT,
-            is_classic INTEGER DEFAULT 0,
-            is_distinct INTEGER DEFAULT 0,
-            is_per_col INTEGER DEFAULT 0,
-            is_no_num INTEGER DEFAULT 0,
-            is_prefill INTEGER DEFAULT 0,
-            res_time_z3 REAL,
-            res_timeout_z3 INTEGER DEFAULT 0
-        );"""
-cursor.execute(create_table)
-conn.commit()
-def insert_single_data(data):
-    """插入单条数据（适配idx字段和布尔型cond_is_classic）"""
-    cursor = conn.cursor()
-    insert_sql = """
-    INSERT INTO problem_solving_results (
-        problem_instance, problem_grid, idx, try_val,is_sat,
-        is_classic, is_distinct,is_per_col,is_no_num, is_prefill,
-        res_time_z3, res_timeout_z3
-    ) VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?,?,?); 
-    """
-    cursor.execute(insert_sql, data)
-    conn.commit()
+from z3_wrapper import Solver
+#from jz3.src.z3_wrapper import Solver
 
-def to_data(
-    i, j,
-    _nums,
-    try_val,
-    is_sat,
-    is_classic,
-    is_distinct,
-    is_per_col,
-    is_no_num,
-    is_prefill,
-    res_time_z3,
-    res_timeout_z3
-):
-    data = (
-        i*9 + j,
-        ''.join(str(element) for row in _nums for element in row),
-        f"({i},{j})",
-        try_val,
-        is_sat,
-        is_classic,
-        is_distinct,
-        is_per_col,
-        is_no_num,
-        is_prefill,
-        res_time_z3,
-        res_timeout_z3
-    )
-    return data
 class Sudoku:
     _valid_charset = set(range(0, 10))
     
@@ -91,6 +31,7 @@ class Sudoku:
             verbose: bool = False,
             hard_smt_log_dir: str = "",
             hard_sudoku_log_path: str = "",
+            db_path='heuristic.db',
     ):
         """
         classic: keep for API parity; this refactor supports classic-only constraints for now.
@@ -121,7 +62,11 @@ class Sudoku:
         self._cnt = 0
         
         random.seed(seed)
-        
+        self._db_path = db_path
+        self.conn = sqlite3.connect(self._db_path)
+        self.cursor = self.conn.cursor()
+        if not self.check_db_initialization():
+            self.create_table()
         # Base puzzle numbers (0 means empty)
         self._nums: List[List[int]] = [[0 for _ in range(9)] for _ in range(9)]
         self.load_numbers(sudoku_array[:81])
@@ -129,7 +74,15 @@ class Sudoku:
         # Conditional solver
         self._solver = Solver(benchmark_mode=benchmark_mode, record_smt=record_smt)
         self._solver.set("timeout", timeout_ms)
-        
+        self._solver.set("random_seed", seed)
+        self._solver.set("smt.random_seed", seed)
+        self._solver.set("auto_config", True)
+        self._solver.set("phase_selection", 1)
+
+        self._solver.set("threads", 1)
+        self._solver.set("sls.parallel", False)
+
+
         # --- CVs (atomic) ---
         # Building blocks (straightforward names for UI/DB)
         self.cv_bool = z3.Bool("bool")
@@ -160,6 +113,76 @@ class Sudoku:
         # Generation bookkeeping
         self._penalty = 0
     
+    # -------------------------
+    # db functions
+    # -------------------------
+    def close_db(self):
+        self.conn.close()
+    def check_db_initialization(self):
+        query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?;"
+        self.cursor.execute(query, ('problem_solving_results',))
+        result = self.cursor.fetchone()
+        return result is not None
+
+    def create_table(self):
+        create_table ="""
+        CREATE TABLE IF NOT EXISTS problem_solving_results (
+            ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_instance INTEGER,
+            problem_grid TEXT,
+            idx TEXT,
+            try_val INTEGER,
+            is_sat TEXT,
+            is_classic INTEGER DEFAULT 0,
+            is_distinct INTEGER DEFAULT 0,
+            is_per_col INTEGER DEFAULT 0,
+            is_no_num INTEGER DEFAULT 0,
+            is_prefill INTEGER DEFAULT 0,
+            res_time_z3 REAL,
+            res_timeout_z3 INTEGER DEFAULT 0
+        );"""
+        self.cursor.execute(create_table)
+        self.conn.commit()
+
+    def insert_single_data(self,data):
+        insert_sql = """
+        INSERT INTO problem_solving_results (
+            problem_instance, problem_grid, idx, try_val,is_sat,
+            is_classic, is_distinct,is_per_col,is_no_num, is_prefill,
+            res_time_z3, res_timeout_z3
+        ) VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?,?,?); 
+        """
+        self.cursor.execute(insert_sql, data)
+        self.conn.commit()
+    def to_data(self,
+        i, j,
+        _nums,
+        try_val,
+        is_sat,
+        is_classic,
+        is_distinct,
+        is_per_col,
+        is_no_num,
+        is_prefill,
+        res_time_z3,
+        res_timeout_z3
+    ):
+        data = (
+            i*9 + j,
+            ''.join(str(element) for row in _nums for element in row),
+            f"({i},{j})",
+            try_val,
+            is_sat,
+            is_classic,
+            is_distinct,
+            is_per_col,
+            is_no_num,
+            is_prefill,
+            res_time_z3,
+            res_timeout_z3
+        )
+        return data
+
     # -------------------------
     # CV setup
     # -------------------------
@@ -416,7 +439,7 @@ class Sudoku:
                         res_time = et - st
                         res_timeout = 1 if check == z3.unknown else 0
                         is_sat = 'sat' if check == z3.sat else 'unsat'
-                        data = to_data(
+                        data = self.to_data(
                             i,
                             j,
                             self._nums,
@@ -432,7 +455,7 @@ class Sudoku:
                         )
                         self._times.append(res_time)
                         self._cnt += 1
-                        insert_single_data(data)
+                        self.insert_single_data(data)
 
                     while check != z3.sat:
                         if check == z3.unknown:
@@ -448,7 +471,7 @@ class Sudoku:
                         res_time = et - st
                         res_timeout = 1 if check == z3.unknown else 0
                         is_sat = 'sat' if check == z3.sat else 'unsat'
-                        data = to_data(
+                        data = self.to_data(
                             i,
                             j,
                             self._nums,
@@ -464,7 +487,7 @@ class Sudoku:
                         )
                         self._times.append(res_time)
                         self._cnt += 1
-                        insert_single_data(data)
+                        self.insert_single_data(data)
                     
                     self.add_constraint(i, j, try_val)
                 
@@ -498,7 +521,7 @@ class Sudoku:
                             res_time = et - st
                             res_timeout = 1 if res == z3.unknown else 0
                             is_sat = 'sat' if res == z3.sat else 'unsat'
-                            data = to_data(
+                            data = self.to_data(
                                 r,
                                 c,
                                 self._nums,
@@ -514,7 +537,7 @@ class Sudoku:
                             )
                             self._times.append(res_time)
                             self._cnt += 1
-                            insert_single_data(data)
+                            self.insert_single_data(data)
                             if res == z3.sat:
                                 self.add_constraint(r, c, num)
                                 cols.remove(c)
@@ -527,7 +550,7 @@ class Sudoku:
             print("Generated full sudoku:")
             for row in self._nums:
                 print(row)
-        
+        #self.close_db()
         return self._nums, self._penalty
     
     # -------------------------
@@ -683,8 +706,8 @@ def gen_multi_full_sudoku(constraints, seed=42, max_count=1, **kwargs):
 #     s = Sudoku(empty_list)
 if __name__ == '__main__':
     # constraints = (True, False, True, True, True)
-    constraints = (True, True, True, False, True)
-    print(gen_full_sudoku(*constraints, seed=42, benchmark_mode=False, record_smt=True))  # (2.1086909770965576, ...)
+    #constraints = (True, True, True, False, True)
+    #print(gen_full_sudoku(*constraints, seed=42, benchmark_mode=False, record_smt=True))  # (2.1086909770965576, ...)
     constraints = [
     # Arithmetic – Distinct
     (True, True,  True,  False, True),
@@ -705,11 +728,11 @@ if __name__ == '__main__':
     complete_times, performance = gen_multi_full_sudoku(constraints, seed=42, benchmark_mode=False, record_smt=True)  # (2.1086909770965576, ...)
     print('complete times:',complete_times)
     print('performance:',performance)
-    optimal_performance = min(performance.values())
-    for k,v in performance.items():
-        if v == optimal_performance:
-            optimal_constraint = k
-            break
+    optimal_constraint = min(
+    performance.items(),
+    key=lambda x: (round(x[1], 11), x[0]))[0]
+    optimal_performance = performance[optimal_constraint]
+
     print("optimal constraints:",optimal_constraint)
     print("optimal performance:",optimal_performance)
     

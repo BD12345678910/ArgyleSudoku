@@ -11,7 +11,9 @@ from copy import deepcopy
 import time
 from typing import *
 from pathlib import Path
-from jz3.src.z3_wrapper import Solver
+from z3_wrapper import Solver
+import sqlite3
+#from jz3.src.z3_wrapper import Solver
 
 
 # z3.set_param('parallel.enable',True)
@@ -32,7 +34,7 @@ class Sudoku:
     def __init__(self, sudoku_array: List[int], classic: bool, distinct: bool, per_col: bool, no_num: bool,
                  prefill: bool, seed=0, hard_smt_logPath="", hard_sudoku_logPath="", verbose=False,
                  distinct_digits=False,
-                 heuristic_search_mode=False, benchmark_mode=True
+                 heuristic_search_mode=False, benchmark_mode=True, db_path='sudoku.db'
                  ):
         """
         Only write a logFile when a path is provided
@@ -80,6 +82,13 @@ class Sudoku:
         self._heuristic_search_mode = heuristic_search_mode
         self._heuristic_solver = Solver(benchmark_mode=benchmark_mode)
         self._heuristic_solver.add_global_constraints(z3.Or(self._condition_var_distinct, self._condition_var_pbeq))
+        self.db_path = db_path
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        self._times = []
+        self._cnt = 0
+        if not self.check_db_initialization():
+            self.create_table()
         
         if seed == 0:
             print("WARNING: NO random seed was set for solver class. "
@@ -105,6 +114,78 @@ class Sudoku:
         assert (len(sudoku_array) == 81), f"Invalid sudoku string provided! length:{len(sudoku_array)}"
         self.load_numbers(sudoku_array[:81])
     
+    # ----------
+    # db functions 
+    # ----------
+    def close_db(self):
+        self.conn.close()
+    def check_db_initialization(self):
+        query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?;"
+        self.cursor.execute(query, ('problem_solving_results',))
+        result = self.cursor.fetchone()
+        return result is not None
+
+    def create_table(self):
+        create_table ="""
+        CREATE TABLE IF NOT EXISTS problem_solving_results (
+            ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_instance INTEGER,
+            problem_grid TEXT,
+            idx TEXT,
+            try_val INTEGER,
+            is_sat TEXT,
+            is_classic INTEGER DEFAULT 0,
+            is_distinct INTEGER DEFAULT 0,
+            is_per_col INTEGER DEFAULT 0,
+            is_no_num INTEGER DEFAULT 0,
+            is_prefill INTEGER DEFAULT 0,
+            res_time_z3 REAL,
+            res_timeout_z3 INTEGER DEFAULT 0
+        );"""
+        self.cursor.execute(create_table)
+        self.conn.commit()
+
+    def insert_single_data(self,data):
+        insert_sql = """
+        INSERT INTO problem_solving_results (
+            problem_instance, problem_grid, idx, try_val,is_sat,
+            is_classic, is_distinct,is_per_col,is_no_num, is_prefill,
+            res_time_z3, res_timeout_z3
+        ) VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?,?,?); 
+        """
+        self.cursor.execute(insert_sql, data)
+        self.conn.commit()
+    def to_data(self,
+        i, j,
+        _nums,
+        try_val,
+        is_sat,
+        is_classic,
+        is_distinct,
+        is_per_col,
+        is_no_num,
+        is_prefill,
+        res_time_z3,
+        res_timeout_z3
+    ):
+        data = (
+            i*9 + j,
+            ''.join(str(element) for row in _nums for element in row),
+            f"({i},{j})",
+            try_val,
+            is_sat,
+            is_classic,
+            is_distinct,
+            is_per_col,
+            is_no_num,
+            is_prefill,
+            res_time_z3,
+            res_timeout_z3
+        )
+        return data
+
+
+
     def generate_smt2_file(self):
         return self._solver.generate_smtlib()
     
@@ -298,14 +379,57 @@ class Sudoku:
                         x = [k for k in range(1, 10)]
                         random.shuffle(x)
                         tryVal = x.pop()
+                        st = time.perf_counter()
                         check = self.check_condition(i, j, tryVal)
+                        et = time.perf_counter()
+                        res_time = et - st
+                        res_timeout = 1 if check == z3.unknown else 0
+                        is_sat = 'sat' if check == z3.sat else 'unsat'
+                        data = self.to_data(
+                            i,
+                            j,
+                            self._nums,
+                            tryVal,
+                            is_sat,
+                            int(self._classic),
+                            int((not self._no_num) and self._distinct is True),
+                            int(self._per_col),
+                            int(self._no_num),
+                            int(self._prefill),
+                            res_time,
+                            res_timeout
+                        )
+                        self._times.append(res_time)
+                        self._cnt += 1
+                        self.insert_single_data(data)
                     while check != z3.sat:
                         if check is None:
                             raise "ERROR, check is not assigned properly"
                         if check == z3.unknown:
                             s_new = self.new_solver()
+                            st = time.perf_counter()
                             check = s_new.check_condition(i, j, tryVal)
-                            
+                            et = time.perf_counter()
+                            res_time = et - st
+                            res_timeout = 1 if check == z3.unknown else 0
+                            is_sat = 'sat' if check == z3.sat else 'unsat'
+                            data = self.to_data(
+                                i,
+                                j,
+                                self._nums,
+                                tryVal,
+                                is_sat,
+                                int(self._classic),
+                                int((not self._no_num) and self._distinct is True),
+                                int(self._per_col),
+                                int(self._no_num),
+                                int(self._prefill),
+                                res_time,
+                                res_timeout
+                            )
+                            self._times.append(res_time)
+                            self._cnt += 1
+                            self.insert_single_data(data)
                             # Record to log path
                             if self._hard_smt_log_dir:
                                 self.write_to_smt_and_sudoku_file((i, j), tryVal, str(check), True)
@@ -323,7 +447,29 @@ class Sudoku:
                                 print(f'Current row: {self._nums}')
                                 raise 'Tried all values, no luck, check gen_solved_sudoku'
                             tryVal = x.pop()
+                            st = time.perf_counter()
                             check = self.check_condition(i, j, tryVal)
+                            et = time.perf_counter()
+                            res_time = et - st
+                            res_timeout = 1 if check == z3.unknown else 0
+                            is_sat = 'sat' if check == z3.sat else 'unsat'
+                            data = self.to_data(
+                                i,
+                                j,
+                                self._nums,
+                                tryVal,
+                                is_sat,
+                                int(self._classic),
+                                int((not self._no_num) and self._distinct is True),
+                                int(self._per_col),
+                                int(self._no_num),
+                                int(self._prefill),
+                                res_time,
+                                res_timeout
+                            )
+                            self._times.append(res_time)
+                            self._cnt += 1
+                            self.insert_single_data(data)
                     self._nums[i][j] = int(tryVal)
                     if self._no_num:
                         self._solver.add(self._grid[i][j][tryVal - 1])
@@ -353,7 +499,29 @@ class Sudoku:
                         column_filled = False
                         for c in cols:
                             if self._nums[r][c] == 0:
+                                st = time.perf_counter()
                                 condition = self.check_condition(r, c, num)
+                                et = time.perf_counter()
+                                res_time = et - st
+                                res_timeout = 1 if condition == z3.unknown else 0
+                                is_sat = 'sat' if condition== z3.sat else 'unsat'
+                                data = self.to_data(
+                                    r,
+                                    c,
+                                    self._nums,
+                                    num,
+                                    is_sat,
+                                    int(self._classic),
+                                    int((not self._no_num) and self._distinct is True),
+                                    int(self._per_col),
+                                    int(self._no_num),
+                                    int(self._prefill),
+                                    res_time,
+                                    res_timeout
+                                )
+                                self._times.append(res_time)
+                                self._cnt += 1
+                                self.insert_single_data(data)
                                 if condition == z3.sat:
                                     self.add_constaint(r, c, num)
                                     cols.remove(c)
@@ -363,8 +531,30 @@ class Sudoku:
                                 else:
                                     if condition == z3.unknown:
                                         s_new = self.new_solver()
+                                        st = time.perf_counter()
                                         check = s_new.check_condition(r, c, num)
-                                        
+                                        et = time.perf_counter()
+                                        res_time = et - st
+                                        res_timeout = 1 if check == z3.unknown else 0
+                                        is_sat = 'sat' if check== z3.sat else 'unsat'
+                                        data = self.to_data(
+                                            r,
+                                            c,
+                                            self._nums,
+                                            num,
+                                            is_sat,
+                                            int(self._classic),
+                                            int((not self._no_num) and self._distinct is True),
+                                            int(self._per_col),
+                                            int(self._no_num),
+                                            int(self._prefill),
+                                            res_time,
+                                            res_timeout
+                                        )
+                                        self._times.append(res_time)
+                                        self._cnt += 1
+                                        self.insert_single_data(data)
+
                                         if self._hard_smt_log_dir:
                                             self.write_to_smt_and_sudoku_file((r, c), num, str(check), True)
                                         else:
